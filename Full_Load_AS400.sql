@@ -7,11 +7,13 @@ HANDLER = 'main'
 AS
 $$
 import json
-
+import logging
 import pandas as pd
 from snowflake.snowpark.context import get_active_session
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
 
-# casting informer datatypes to snowflake compatible datatypes
+# Casting informer datatypes to snowflake compatible datatypes
 def build_cast_sql(table_name, column_config):
     dtype_map = {
         "CHAR": "VARCHAR",
@@ -20,7 +22,12 @@ def build_cast_sql(table_name, column_config):
         "NUMERIC": "NUMBER",
         "DATE": "DATE",
         "BOOLEAN":"BOOLEAN",
-        "TIMESTAMP":"TIMESTAMP_TZ"
+        "TIMESTAMP":"TIMESTAMP_TZ",
+        "VARCHAR": "VARCHAR",
+        "INT": "NUMBER",
+        "FLOAT": "FLOAT",
+        "DOUBLE": "DOUBLE",
+        "BINARY": "BINARY"
     }
 
     cast_exprs = []
@@ -45,7 +52,7 @@ def build_cast_sql(table_name, column_config):
 
     return ", ".join(cast_exprs)
 
-# function to replace leading or trailing underscores in column names:
+# Function to replace leading or trailing underscores in column names:
 def clean_alias_in_sql(sql):
     tokens = sql.split()
     result_tokens = []
@@ -81,12 +88,14 @@ def clean_alias_in_sql(sql):
     # print(result_tokens)
     return " ".join(result_tokens)
 
+
+
 def main(session):
     try:
         # Load the configuration from the JSON file
         df = session.sql("""
             SELECT $1
-            FROM @RENTALDB.STAGING.RENTAL_STAGE/config.json
+            FROM @RENTALDB.PROD_RENTALMAN_WSDATAIC.RENTAL_STAGE/config.json
             (FILE_FORMAT => jsonconfig_format)
         """)
         rows = df.collect()
@@ -94,6 +103,7 @@ def main(session):
         config = json.loads(raw_json)
         tables = config['tables']
     except Exception as e:
+        logger.error(f"Error loading config: {e}", exc_info=True)
         return f"Error loading config: {e}"
 
     try:
@@ -104,30 +114,39 @@ def main(session):
                 print(f"⚠️ No config found for {table['original_name']}, skipping...")
                 continue
             cast_sql = build_cast_sql(table['original_name'], column_config)
+            # query = f"""
+            #     SELECT _FIVETRAN_SYNCED as FIVETRAN_SYNCED, _FIVETRAN_DELETED as FIVETRAN_DELETED, {cast_sql}
+            #     FROM RENTALDB.PROD_RENTALMAN_WSDATAIC.{table['original_name']}
+            #     WHERE _FIVETRAN_DELETED = 'FALSE'
+            # """
+
             query = f"""
                 SELECT {cast_sql}
                 FROM RENTALDB.PROD_RENTALMAN_WSDATAIC.{table['original_name']}
                 WHERE _FIVETRAN_DELETED = 'FALSE'
             """
             queries.append((query, table))
+            # print(queries)
     except Exception as e:
+        logger.error(f"Error building queries: {e}", exc_info=True)
         return f"Error building queries: {e}"
 
     try:
         updated_sql_queries = [clean_alias_in_sql(sql[0]) for sql in queries]
-        
-        # Iterate through each table and generate CTAS
+
+        print(updated_sql_queries)
         for (query, table) in zip(updated_sql_queries, tables):
             final_sql = f"""
-                CREATE OR REPLACE TABLE RENTALDB.STAGING.{table['full_form_name']} AS {query};
+                CREATE OR REPLACE TABLE RENTALDB.RAW.{table['full_form_name']} AS {query};
             """
+            print(final_sql)
             session.sql(final_sql).collect()
-            print(f"✅ Table {table['original_name']} written to STAGING")
-        
+            print(f"✅ Table {table['original_name']} written to RAW")
+
     except Exception as e:
+        logger.error(f"Error executing final queries: {e}", exc_info=True)
         return f"Error executing final queries: {e}"
 
     return "✅ All staging tables processed and renamed successfully."
- 
- 
+
 $$;
